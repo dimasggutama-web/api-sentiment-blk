@@ -31,7 +31,12 @@ import nltk
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
-nltk.download('stopwords', quiet=True)
+# Arahkan folder download NLTK ke /tmp (satu-satunya folder yang bisa di-write di Vercel)
+nltk_data_dir = '/tmp/nltk_data'
+os.makedirs(nltk_data_dir, exist_ok=True)
+nltk.data.path.append(nltk_data_dir)
+# Download stopwords ke folder /tmp
+nltk.download('stopwords', download_dir=nltk_data_dir, quiet=True)
 
 # ==============================================================================
 # KONFIGURASI
