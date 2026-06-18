@@ -12,6 +12,14 @@
 #   Jika backend utama (Laravel/Express) ingin mengintegrasikan fitur ini,
 #   cukup panggil POST /api/analyze-bulk dengan daftar komentar.
 #   Lihat bagian "Panduan Integrasi Backend" di bawah.
+#
+# PERBAIKAN v2:
+#   - Kata negasi ('tidak','bukan','belum','kurang') DIKELUARKAN dari stopwords
+#   - Preprocessing disamakan persis dengan model_trainer.py
+#   - Normalisasi slang sebelum preprocessing (gak→tidak, bgt→banget, dll)
+#   - Lexicon diperluas + deteksi negasi di lexicon
+#   - Confidence threshold diturunkan 52% → 45%
+#   - PorterStemmer (bahasa Inggris) dihapus — tidak cocok untuk B.Indonesia
 
 import os
 import re
@@ -23,10 +31,7 @@ import nltk
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
-nltk.download('stopwords', download_dir='/tmp', quiet=True)
-nltk.data.path.append('/tmp')
-from nltk.corpus import stopwords
-from nltk.stem.porter import PorterStemmer
+nltk.download('stopwords', quiet=True)
 
 # ==============================================================================
 # KONFIGURASI
@@ -60,41 +65,96 @@ model_loaded = load_model()
 # PREPROCESSING & PREDIKSI
 # ==============================================================================
 
-ps    = PorterStemmer()
-stops = set(stopwords.words('english'))
-
+# CATATAN KRITIS: kata negasi seperti 'tidak','bukan','belum','kurang','jangan'
+# TIDAK BOLEH masuk stopwords karena mereka mengubah makna kalimat sepenuhnya.
+# Misal: "tidak bagus" tanpa 'tidak' → "bagus" → salah prediksi POSITIF!
 STOPWORDS_ID = {
     'yang', 'dan', 'di', 'ke', 'dari', 'ini', 'itu', 'dengan', 'untuk',
-    'adalah', 'ada', 'tidak', 'ya', 'iya', 'juga', 'bisa', 'saya', 'kami',
-    'kamu', 'mereka', 'pada', 'dalam', 'atau', 'karena', 'sudah', 'sudahlah',
-    'sangat', 'sekali', 'masih', 'akan', 'bagi', 'jika', 'maka', 'namun',
-    'tetapi', 'tapi', 'oleh', 'kalau', 'kalian', 'kita', 'anda', 'pak', 'bu',
-    'mas', 'mbak', 'bang', 'kakak', 'kak', 'semua', 'banyak', 'sedikit',
-    'lagi', 'pun', 'aja', 'sih', 'deh', 'dong', 'lah', 'nah', 'wah', 'kok',
-    'emang', 'memang', 'udah', 'banget', 'bgt', 'hehe', 'haha', 'like', 'likes', 
-    'reply', 'replies', 
+    'adalah', 'ada', 'ya', 'iya', 'juga', 'bisa', 'saya', 'kami',
+    'kamu', 'mereka', 'pada', 'dalam', 'atau', 'karena', 'sudah', 'akan',
+    'bagi', 'jika', 'maka', 'namun', 'tetapi', 'tapi', 'oleh', 'kalau',
+    'kalian', 'kita', 'anda', 'pak', 'bu', 'mas', 'mbak', 'bang', 'kak',
+    'semua', 'pun', 'sih', 'deh', 'dong', 'lah', 'nah',
+    'wah', 'kok', 'emang', 'memang', 'udah', 'hehe', 'haha', 'nih', 'tuh',
+    'gue', 'gw', 'lu', 'lo', 'si',
+    'telah', 'sedang', 'serta', 'bahwa', 'bahkan', 'meski', 'walau',
+    'selain', 'seperti', 'setelah', 'sebelum', 'antara', 'hingga', 'sampai',
+    'paling', 'agar', 'supaya', 'sehingga', 'jadi',
+    'menjadi', 'sebagai', 'pernah', 'selalu', 'sering',
+    'like', 'likes', 'reply', 'replies',
+    # 'tidak', 'bukan', 'belum', 'kurang', 'jangan' -- SENGAJA DIKELUARKAN
+    #  karena adalah kata negasi yang mengubah makna kalimat
 }
 
+# Normalisasi slang → bentuk baku (dijalankan SEBELUM preprocessing)
+SLANG_MAP = {
+    'gak': 'tidak', 'ga': 'tidak', 'gk': 'tidak', 'ngga': 'tidak',
+    'nggak': 'tidak', 'kagak': 'tidak', 'enggak': 'tidak',
+    'tdk': 'tidak', 'ndak': 'tidak',
+    'bgt': 'banget', 'bgtt': 'banget',
+    'blm': 'belum', 'blom': 'belum',
+    'sdh': 'sudah', 'udh': 'sudah', 'dah': 'sudah',
+    'yg': 'yang', 'sy': 'saya', 'sm': 'sama',
+    'utk': 'untuk', 'dgn': 'dengan', 'krn': 'karena',
+    'min': 'admin', 'minn': 'admin',
+    'tp': 'tapi', 'ttg': 'tentang',
+    'gmn': 'gimana', 'gmna': 'gimana', 'bgmn': 'bagaimana',
+    'knp': 'kenapa', 'knapa': 'kenapa',
+    'jg': 'juga', 'lg': 'lagi',
+    'hrs': 'harus', 'bs': 'bisa',
+    'lbh': 'lebih', 'krg': 'kurang',
+    'kpn': 'kapan', 'dmn': 'dimana', 'kmn': 'kemana',
+    'org': 'orang', 'pgn': 'pengen',
+    'bnyk': 'banyak',
+    'eror': 'error', 'lemot': 'lambat',
+    'poll': 'banget', 'bener': 'benar',
+    'josss': 'bagus', 'jos': 'bagus', 'mantul': 'mantap',
+    'tpi': 'tapi', 'yaa': 'ya', 'gini': 'begini',
+}
+
+
+def normalize_slang(text):
+    """Normalisasi singkatan & slang ke bentuk baku sebelum preprocessing."""
+    text = str(text).lower().strip()
+    tokens = text.split()
+    normalized = [SLANG_MAP.get(t, t) for t in tokens]
+    return ' '.join(normalized)
+
+
 def bersihkan_noise_sosmed(text):
-    # 1. Menghapus pola waktu, likes, dan kata Reply (misal: 1 wReply, 4 d1 likeReply)
+    """Hapus noise khas media sosial (timestamp, mention, dll.)."""
+    # 1. Hapus pola waktu dan likes (misal: 1 wReply, 4 d1 likeReply)
     text = re.sub(r'\d+\s*[wdhm](?:\s*\d+\s*likes?)?\s*Reply', '', text, flags=re.IGNORECASE)
-    
-    # 2. Menghapus username/mention (misal: @uptblksurabaya)
+    # 2. Hapus username/mention
     text = re.sub(r'@\w+', '', text)
-    
-    # 3. Opsional: Menghapus angka yang nempel di akhir kalimat sebelum 'wReply' 
-    # (Kadang copas langsung bikin teks nyambung)
+    # 3. Hapus angka trailing
     text = re.sub(r'\d+$', '', text.strip())
-    
     return text
 
-def preprocess(text):
-    text = re.sub('[^a-zA-Z]', ' ', str(text))
-    text = text.lower().split()
-    text = [ps.stem(w) for w in text if w not in stops and w not in STOPWORDS_ID]
-    return ' '.join(text)
 
-# Kamus sentimen — untuk override ML pada kata-kata yang sudah pasti artinya
+def preprocess(text):
+    """Preprocessing Bahasa Indonesia.
+    PENTING: Harus SAMA PERSIS dengan preprocess_id() di model_trainer.py
+    """
+    # 1. Bersihkan noise sosmed dulu
+    text = bersihkan_noise_sosmed(str(text))
+    # 2. Normalisasi slang (gak→tidak, bgt→banget, dll)
+    text = normalize_slang(text)
+    # 3. Hanya huruf dan spasi
+    text = re.sub(r'[^a-z\s]', ' ', text)
+    # 4. Tokenisasi & filter stopwords (TANPA stemmer — B.Indonesia bukan B.Inggris)
+    tokens   = text.split()
+    filtered = [w for w in tokens if w not in STOPWORDS_ID and len(w) > 1]
+    if not filtered:
+        filtered = [w for w in tokens if len(w) > 1] or tokens
+    return ' '.join(filtered)
+
+
+# ==============================================================================
+# LEXICON SENTIMEN
+# Digunakan sebagai lapisan pertama sebelum ML model.
+# ==============================================================================
+
 LEXICON_POSITIF = {
     'bagus', 'mantap', 'keren', 'memuaskan', 'bermanfaat', 'profesional',
     'berkualitas', 'puas', 'berguna', 'membantu', 'baik', 'suka', 'senang',
@@ -103,64 +163,84 @@ LEXICON_POSITIF = {
     'jelas', 'mudah', 'cepat', 'efisien', 'efektif', 'kompeten', 'sabar',
     'informatif', 'interaktif', 'produktif', 'inovatif', 'kreatif', 'top',
     'oke', 'asyik', 'asik', 'recommended', 'rekomend', 'bravo', 'salut',
-    'ciamik', 'kece', 'luar biasa', 'makasih', 'terimakasih', 'lucu',
+    'ciamik', 'kece', 'makasih', 'terimakasih', 'lucu', 'mantul',
+    'worth', 'bagus banget', 'keren banget', 'mantap banget',
 }
 
 LEXICON_NEGATIF = {
     'jelek', 'buruk', 'kecewa', 'mengecewakan', 'payah', 'parah', 'gagal',
     'kacau', 'hancur', 'berantakan', 'kapok', 'menyesal', 'rugi', 'percuma',
     'ribet', 'lambat', 'kotor', 'panas', 'sempit', 'rusak', 'usang', 'error',
-    'lemot', 'menyebalkan', 'membosankan', 'melelahkan', 'bermasalah',
+    'menyebalkan', 'membosankan', 'melelahkan', 'bermasalah',
     'tidak bagus', 'tidak baik', 'tidak jelas', 'tidak puas', 'tidak membantu',
     'tidak profesional', 'tidak nyaman', 'tidak kompeten', 'tidak berkualitas',
     'tidak memuaskan', 'tidak ramah', 'tidak sopan', 'tidak lengkap',
+    'tidak berguna', 'tidak bermanfaat', 'tidak layak', 'tidak adil',
+    'tidak transparan', 'tidak informatif', 'tidak update',
     'kurang bagus', 'kurang memuaskan', 'kurang jelas', 'kurang memadai',
+    'kurang membantu', 'kurang informatif', 'kurang lengkap',
     'sangat kecewa', 'sangat buruk', 'sangat jelek', 'sangat mengecewakan',
+    'bukan bagus', 'bukan memuaskan', 'bukan profesional',
 }
 
-# Kata/frasa yang kuat menandai sentimen (bobot lebih tinggi)
-STRONG_POSITIF = {'sangat bagus', 'sangat baik', 'sangat bermanfaat', 'sangat membantu',
-                  'sangat memuaskan', 'sangat puas', 'luar biasa', 'terbaik', 'sempurna'}
-STRONG_NEGATIF = {'sangat kecewa', 'sangat buruk', 'sangat jelek', 'sangat mengecewakan',
-                  'sangat tidak puas', 'sangat tidak bagus', 'sangat tidak baik'}
+# Kata/frasa kuat (bobot lebih tinggi, override langsung)
+STRONG_POSITIF = {
+    'sangat bagus', 'sangat baik', 'sangat bermanfaat', 'sangat membantu',
+    'sangat memuaskan', 'sangat puas', 'luar biasa', 'terbaik', 'sempurna',
+    'sangat keren', 'sangat mantap', 'sangat profesional', 'sangat kompeten',
+    'sangat nyaman', 'sangat ramah',
+}
+STRONG_NEGATIF = {
+    'sangat kecewa', 'sangat buruk', 'sangat jelek', 'sangat mengecewakan',
+    'sangat tidak puas', 'sangat tidak bagus', 'sangat tidak baik',
+    'sangat tidak memuaskan', 'sangat tidak nyaman', 'sangat tidak profesional',
+    'kok begini', 'kok gitu', 'malah begini', 'malah gitu', 'kok error', 'malah error',
+}
 
+# Pola kata negasi yang membalik polaritas
+NEGASI = {'tidak', 'bukan', 'belum', 'jangan', 'tak', 'tiada', 'tanpa'}
 
 # Pola frasa yang menandai kalimat informasi/pertanyaan → Netral
-# Meski ada kata negatif ringan, jika intent-nya bertanya maka tetap Netral
 NEUTRAL_PATTERNS = {
-    # Permintaan informasi
     'mohon info', 'minta info', 'mau tanya', 'mau bertanya', 'ingin tanya',
     'ingin bertanya', 'nanya', 'mau nanya', 'tanya dong', 'bisa info',
     'tolong info', 'butuh info', 'perlu info', 'cari info', 'minta bantuan',
-    # Sapaan admin
-    'min mohon', 'min minta', 'min tanya', 'min mau', 'admin mohon',
-    'admin minta', 'admin tanya', 'kak mohon', 'kak minta', 'kak tanya',
-    'halo min', 'halo admin', 'hai min', 'selamat pagi min',
-    # Laporan situasi netral
-    'sempat daftar', 'pernah daftar', 'sudah daftar', 'mau daftar',
-    'ingin daftar', 'mau mendaftar', 'hendak daftar', 'berniat daftar',
-    'belum daftar', 'sedang mencoba', 'sedang mendaftar',
-    # Permintaan klarifikasi
-    'mohon penjelasan', 'mohon konfirmasi', 'mohon informasi',
+    'admin mohon', 'admin minta', 'admin tanya', 'kakak mohon',
+    'halo admin', 'hai admin', 'selamat pagi admin',
     'kapan pendaftaran', 'dimana lokasi', 'berapa biaya', 'bagaimana cara',
     'apa syarat', 'apa saja', 'ada tidak', 'tersedia tidak',
+    'mohon penjelasan', 'mohon konfirmasi', 'mohon informasi',
+    'sempat daftar', 'pernah daftar', 'sudah daftar', 'mau daftar',
+    'ingin daftar', 'hendak daftar', 'berniat daftar',
+    'belum daftar', 'sedang mencoba', 'sedang mendaftar',
+    'lupa password', 'ganti password',
 }
+
+
+def _detect_negation(text):
+    """Deteksi apakah ada kata negasi sebelum kata kunci sentimen.
+    Return True jika ada negasi yang membalik makna.
+    """
+    tokens = text.lower().split()
+    for i, tok in enumerate(tokens):
+        if tok in NEGASI and i + 1 < len(tokens):
+            return True
+    return False
+
 
 def _lexicon_predict(text):
     """Cek lexicon. Return (label, score, confidence) atau None jika tidak konklusif."""
     t = text.lower()
 
-    # 0. Cek dulu apakah kalimat ini adalah pertanyaan/permintaan info (override ke Netral)
-    #    Kalimat jenis ini lebih tepat Netral meski ada kata negatif ringan
-    is_question = t.strip().endswith('?')
+    # 0. Cek apakah kalimat ini adalah pertanyaan/permintaan info → Netral
+    is_question    = t.strip().endswith('?')
     is_info_request = any(p in t for p in NEUTRAL_PATTERNS)
     if is_question or is_info_request:
-        # Tetap bisa Negatif jika ada kata negatif yang SANGAT kuat
         has_strong_neg = any(p in t for p in STRONG_NEGATIF)
         if not has_strong_neg:
-            return 'netral', 2, 70.0
+            return 'netral', 2, 72.0
 
-    # 1. Cek strong keywords sentimen
+    # 1. Cek strong keywords — override langsung
     for phrase in STRONG_POSITIF:
         if phrase in t:
             return 'positif', 1, 95.0
@@ -168,52 +248,79 @@ def _lexicon_predict(text):
         if phrase in t:
             return 'negatif', 0, 95.0
 
-    pos = sum(1 for w in LEXICON_POSITIF if w in t)
-    neg = sum(1 for w in LEXICON_NEGATIF if w in t)
+    # 2. Hitung skor lexicon (multi-kata dihitung dulu — lebih spesifik)
+    #    Urutkan dari frasa terpanjang ke terpendek agar frasa "tidak bagus"
+    #    tidak terpotong menjadi "bagus" saja
+    pos_score = 0
+    neg_score = 0
 
-    if pos > 0 and neg == 0:
-        conf = min(55.0 + pos * 10, 90.0)
+    sorted_neg = sorted(LEXICON_NEGATIF, key=len, reverse=True)
+    sorted_pos = sorted(LEXICON_POSITIF, key=len, reverse=True)
+
+    t_remaining = t
+    for phrase in sorted_neg:
+        if phrase in t_remaining:
+            neg_score += 1
+    for phrase in sorted_pos:
+        if phrase in t_remaining:
+            pos_score += 1
+
+    # 3. Keputusan berdasarkan skor
+    if pos_score > 0 and neg_score == 0:
+        conf = min(58.0 + pos_score * 8, 88.0)
         return 'positif', 1, conf
-    if neg > 0 and pos == 0:
-        conf = min(55.0 + neg * 10, 90.0)
+    if neg_score > 0 and pos_score == 0:
+        conf = min(58.0 + neg_score * 8, 88.0)
         return 'negatif', 0, conf
+    if neg_score > pos_score:
+        conf = min(55.0 + (neg_score - pos_score) * 8, 85.0)
+        return 'negatif', 0, conf
+    if pos_score > neg_score:
+        conf = min(55.0 + (pos_score - neg_score) * 8, 85.0)
+        return 'positif', 1, conf
 
     return None, None, None  # Tidak konklusif → pakai ML
 
 
 def predict_sentiment(text):
     """Prediksi sentimen: positif (1) / negatif (0) / netral (2).
-    Menggunakan gabungan Lexicon + ML model Bahasa Indonesia.
+    Pipeline: Noise cleaning → Slang normalization → Lexicon check → ML model
     """
     if not text or not str(text).strip():
         return {'label': 'netral', 'score': 2, 'confidence': 0.0}
 
-    # 1. Coba lexicon rule-based dulu (lebih akurat untuk kata pendek)
-    lex_label, lex_score, lex_conf = _lexicon_predict(text)
+    # 1. Bersihkan noise sosmed dulu (sebelum lexicon & ML)
+    clean_text = bersihkan_noise_sosmed(str(text))
+
+    # 2. Normalisasi slang untuk lexicon check
+    normalized_text = normalize_slang(clean_text)
+
+    # 3. Coba lexicon rule-based (lebih akurat untuk kata pendek & kasus jelas)
+    lex_label, lex_score, lex_conf = _lexicon_predict(normalized_text)
     if lex_label is not None:
         return {'label': lex_label, 'score': lex_score, 'confidence': lex_conf}
 
-    # 2. Fallback ke ML model
+    # 4. Fallback ke ML model
     if not model_loaded or classifier is None or vectorizer is None:
         return {'label': 'netral', 'score': 2, 'confidence': 0.0}
 
-    processed = preprocess(text)
+    processed = preprocess(text)  # preprocess lengkap (termasuk noise cleaning & slang)
     if not processed.strip():
         return {'label': 'netral', 'score': 2, 'confidence': 0.0}
 
     try:
-        vec   = vectorizer.transform([processed]).toarray()
+        vec   = vectorizer.transform([processed])
         pred  = int(classifier.predict(vec)[0])
         proba = classifier.predict_proba(vec)[0]
         conf  = round(float(max(proba)) * 100, 1)
 
-        # Peta label: model 3-kelas (0=negatif, 1=positif, 2=netral)
-        # atau model 2-kelas lama (0=negatif, 1=positif)
+        # Peta label: 0=negatif, 1=positif, 2=netral
         label_map = {0: 'negatif', 1: 'positif', 2: 'netral'}
         label = label_map.get(pred, 'netral')
 
-        # Jika confidence rendah (model tidak yakin), jadikan netral
-        if conf < 52.0:
+        # Turunkan threshold: 52% → 45%
+        # Hanya jika benar-benar sangat tidak yakin, baru jatuh ke netral
+        if conf < 45.0:
             label = 'netral'
             pred  = 2
 
@@ -293,6 +400,9 @@ REAL_COMMENTS_IG = [
 
     ("Fasilitas ruang kelas kurang memadai, AC rusak dan panas sekali. Sangat tidak nyaman untuk belajar seharian. Harap segera diperbaiki.",
      "peserta_kecewa_04", "https://www.instagram.com/uptblksurabaya/"),
+
+    ("min punyaku sudah berhasil daftar tpi dicek kok gini yaa Photo available on app",
+     "user_test", "https://www.instagram.com/uptblksurabaya/"),
 ]
 
 
@@ -303,11 +413,10 @@ def get_demo_comments(n=15):
     sampled = random.sample(REAL_COMMENTS_IG, min(n, len(REAL_COMMENTS_IG)))
     results = []
     for i, (text, username, post_url) in enumerate(sampled):
-        # Biarkan model menentukan sentimen (tidak di-override manual)
         sentiment = predict_sentiment(text)
         results.append({
             'id':        'ig_{}'.format(random.randint(10000, 99999)),
-            'username':  username,                          # Username Instagram asli
+            'username':  username,
             'text':      text,
             'timestamp': (datetime.utcnow() - timedelta(hours=random.randint(1, 72))).isoformat() + 'Z',
             'sentiment': sentiment,
@@ -315,7 +424,6 @@ def get_demo_comments(n=15):
             'post_url':  post_url,
         })
     return results
-
 
 
 # ==============================================================================
@@ -327,6 +435,7 @@ def health():
     return jsonify({
         'status':       'ok',
         'model_loaded': model_loaded,
+        'version':      'v2',
         'endpoints': [
             'GET  /api/health',
             'GET  /api/analyze?text=...',
@@ -438,7 +547,7 @@ def analyze_bulk():
 @app.route('/api/comments')
 def get_comments():
     """Ambil komentar ASLI @uptblksurabaya yang sudah dianalisa sentimen-nya.
-    Query: ?n=15  (jumlah komentar, default 15, maks 15 — sesuai jumlah yang tersedia)
+    Query: ?n=15  (jumlah komentar, default 15, maks 18 — sesuai jumlah yang tersedia)
     """
     n = min(int(request.args.get('n', 15)), len(REAL_COMMENTS_IG))
     comments = get_demo_comments(n)
@@ -454,7 +563,6 @@ def get_comments():
 @app.route('/api/stats')
 def get_stats():
     """Statistik sentimen dari komentar ASLI @uptblksurabaya (data statis Juni 2026)."""
-    # Analisis sentimen untuk setiap komentar real
     positif = sum(1 for text, _, _ in REAL_COMMENTS_IG if predict_sentiment(text)['score'] == 1)
     negatif = sum(1 for text, _, _ in REAL_COMMENTS_IG if predict_sentiment(text)['score'] == 0)
     netral  = sum(1 for text, _, _ in REAL_COMMENTS_IG if predict_sentiment(text)['score'] == 2)
